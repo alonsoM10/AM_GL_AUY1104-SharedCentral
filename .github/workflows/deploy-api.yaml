@@ -91,7 +91,7 @@ jobs:
           ssh-private-key: ${{ secrets.EA2_SSH_PRIVATE_KEY }}
 
       - name: 1 · SSH al servidor K3S
-        run: ssh -o StrictHostKeyChecking=accept-new "ubuntu@\${{ inputs.k3s-server-public-ip }}" 'echo ok'
+        run: ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" 'echo ok'
 
       - name: Checkout (manifiestos K8s)
         uses: actions/checkout@v4
@@ -100,10 +100,10 @@ jobs:
         run: |
           set -euo pipefail
           test -d k8s || { echo "::error::Falta carpeta k8s/ en la raíz del repo"; exit 1; }
-          ssh -o StrictHostKeyChecking=accept-new "ubuntu@\${{ inputs.k3s-server-public-ip }}" 'sudo rm -rf /tmp/k8s-deploy'
-          scp -o StrictHostKeyChecking=accept-new -r k8s "ubuntu@\${{ inputs.k3s-server-public-ip }}:/tmp/k8s-deploy"
-          ssh -o StrictHostKeyChecking=accept-new "ubuntu@\${{ inputs.k3s-server-public-ip }}" \\
+          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" 'sudo rm -rf /tmp/k8s-deploy'
+          scp -o StrictHostKeyChecking=accept-new -r k8s "ubuntu@${{ inputs.k3s-server-public-ip }}:/tmp/k8s-deploy"
+          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" \\
             'sudo k3s kubectl apply -f /tmp/k8s-deploy/'
 
       - name: Verificar pods
-        run: ssh -o StrictHostKeyChecking=accept-new "ubuntu@\${{ inputs.k3s-server-public-ip }}" 'sudo k3s kubectl get pods -o wide'
+        run: ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" 'sudo k3s kubectl get pods -o wide'
