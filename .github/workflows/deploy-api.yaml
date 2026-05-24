@@ -70,14 +70,16 @@ jobs:
           username: ${{ secrets.DOCKER_USERNAME }}
           password: ${{ secrets.DOCKER_PASSWORD }}
 
-      - name: 3 · Armar la imagen y publicarla
+      - name: 3 . Armar la imagen y publicarla
         run: |
-          IMAGEN_COMPLETA="\${{ secrets.DOCKER_USERNAME }}/\${{ inputs.image-name }}"
-          docker build \
-            -t "\${IMAGEN_COMPLETA}:\${{ inputs.image-tag }}" \
-            -t "\${IMAGEN_COMPLETA}:latest" \
-            .
-          docker push --all-tags "\${IMAGEN_COMPLETA}"
+         IMAGEN_COMPLETA="${{ secrets.DOCKER_USERNAME }}/${{ inputs.image-name }}"
+      
+         docker build \
+           -t "${IMAGEN_COMPLETA}:${{ inputs.image-tag }}" \
+           -t "${IMAGEN_COMPLETA}:latest" \
+           .
+        
+         docker push --all-tags "${IMAGEN_COMPLETA}"
 
   deploy-to-k8s:
     name: Deploy to AWS K3S
