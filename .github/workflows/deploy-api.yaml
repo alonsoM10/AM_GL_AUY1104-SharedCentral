@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────────────────────
-# Receta compartida: tests → build → push → deploy a k3s
+# Receta compartida: tests → build → push → deploy Blue-Green a k3s
 # Otros repos la llaman vía workflow_call
 # ─────────────────────────────────────────────────────────────
 name: Subir la API a Docker Hub (receta reutilizable)
@@ -19,6 +19,16 @@ on:
         description: IP pública del servidor K3S
         required: true
         type: string
+      namespace:
+        description: Namespace de Kubernetes donde desplegar
+        required: false
+        type: string
+        default: default
+      app-env:
+        description: Entorno de la app (ej. prod, staging)
+        required: false
+        type: string
+        default: prod
     secrets:
       DOCKER_USERNAME:
         required: true
@@ -41,6 +51,16 @@ on:
         description: IP pública del servidor K3S
         required: true
         type: string
+      namespace:
+        description: Namespace de Kubernetes donde desplegar
+        required: false
+        type: string
+        default: default
+      app-env:
+        description: Entorno de la app (ej. prod, staging)
+        required: false
+        type: string
+        default: prod
 
 jobs:
   deps-and-test:
@@ -73,16 +93,16 @@ jobs:
       - name: 3 . Armar la imagen y publicarla
         run: |
          IMAGEN_COMPLETA="${{ secrets.DOCKER_USERNAME }}/${{ inputs.image-name }}"
-      
+
          docker build \
            -t "${IMAGEN_COMPLETA}:${{ inputs.image-tag }}" \
            -t "${IMAGEN_COMPLETA}:latest" \
            .
-        
+
          docker push --all-tags "${IMAGEN_COMPLETA}"
 
   deploy-to-k8s:
-    name: Deploy to AWS K3S
+    name: Deploy Blue-Green a K3S
     needs: build-and-push
     runs-on: ubuntu-latest
     steps:
@@ -93,29 +113,125 @@ jobs:
       - name: 1 · SSH al servidor K3S
         run: ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" 'echo ok'
 
-      - name: Checkout (manifiestos K8s)
+      - name: 2 · Checkout (manifiestos K8s)
         uses: actions/checkout@v4
 
-      - name: Deploy to k3s
-        id: deploy
+      - name: 3 · Detectar color activo y color a desplegar
+        id: colors
         run: |
-          set -euo pipefail
-          test -d k8s || { echo "::error::Falta carpeta k8s/ en la raíz del repo"; exit 1; }
-          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" 'sudo rm -rf /tmp/k8s-deploy'
-          scp -o StrictHostKeyChecking=accept-new -r k8s "ubuntu@${{ inputs.k3s-server-public-ip }}:/tmp/k8s-deploy"
-          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" \
-            'sudo k3s kubectl apply -f /tmp/k8s-deploy/'
-          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" \
-            'sudo k3s kubectl rollout status deployment/demo-api --timeout=60s'
+          SERVER="ubuntu@${{ inputs.k3s-server-public-ip }}"
+          ACTIVE=$(ssh -o StrictHostKeyChecking=accept-new "$SERVER" \
+            'sudo k3s kubectl get service demo-api -n ${{ inputs.namespace }} -o jsonpath="{.spec.selector.color}" 2>/dev/null' || true)
+          ACTIVE="${ACTIVE:-none}"
+          if [ "$ACTIVE" = "blue" ]; then NEW="green"; else NEW="blue"; fi
+          echo "Color activo actual: $ACTIVE"
+          echo "Color a desplegar:   $NEW"
+          echo "active=$ACTIVE" >> "$GITHUB_OUTPUT"
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
 
-      - name: Rollback automático
+      - name: 4 · Renderizar la plantilla del color a desplegar
+        env:
+          COLOR: ${{ steps.colors.outputs.new }}
+          IMAGE: ${{ secrets.DOCKER_USERNAME }}/${{ inputs.image-name }}:${{ inputs.image-tag }}
+          APP_ENV: ${{ inputs.app-env }}
+          NAMESPACE: ${{ inputs.namespace }}
+        run: |
+          envsubst < k8s/deployment-template.yaml > k8s/rendered-deployment.yaml
+          cat k8s/rendered-deployment.yaml
+
+      - name: 5 · Asegurar namespace y Service (sin pisar el selector vigente)
+        run: |
+          SERVER="ubuntu@${{ inputs.k3s-server-public-ip }}"
+          ssh -o StrictHostKeyChecking=accept-new "$SERVER" \
+            'sudo k3s kubectl get namespace ${{ inputs.namespace }} >/dev/null 2>&1 || sudo k3s kubectl create namespace ${{ inputs.namespace }}'
+          if ssh -o StrictHostKeyChecking=accept-new "$SERVER" \
+               'sudo k3s kubectl get service demo-api -n ${{ inputs.namespace }}' >/dev/null 2>&1; then
+            echo "Service demo-api ya existe, no se toca el selector."
+          else
+            scp -o StrictHostKeyChecking=accept-new k8s/service.yaml "$SERVER:/tmp/service.yaml"
+            ssh -o StrictHostKeyChecking=accept-new "$SERVER" \
+              'sudo k3s kubectl apply -n ${{ inputs.namespace }} -f /tmp/service.yaml'
+          fi
+
+      - name: 6 · Desplegar el color inactivo
+        run: |
+          SERVER="ubuntu@${{ inputs.k3s-server-public-ip }}"
+          scp -o StrictHostKeyChecking=accept-new k8s/rendered-deployment.yaml \
+            "$SERVER:/tmp/deployment-${{ steps.colors.outputs.new }}.yaml"
+          ssh -o StrictHostKeyChecking=accept-new "$SERVER" \
+            'sudo k3s kubectl apply -n ${{ inputs.namespace }} -f /tmp/deployment-${{ steps.colors.outputs.new }}.yaml'
+          ssh -o StrictHostKeyChecking=accept-new "$SERVER" \
+            'sudo k3s kubectl rollout status deployment/demo-api-${{ steps.colors.outputs.new }} -n ${{ inputs.namespace }} --timeout=60s'
+
+      - name: 7 · Validación de salud (pre-switch, IP directa de los pods)
+        run: |
+          SERVER="ubuntu@${{ inputs.k3s-server-public-ip }}"
+          ssh -o StrictHostKeyChecking=accept-new "$SERVER" bash -s -- \
+            "${{ inputs.namespace }}" "${{ steps.colors.outputs.new }}" <<'EOF'
+          set -euo pipefail
+          NAMESPACE="$1"
+          NEW_COLOR="$2"
+          PODS=$(sudo k3s kubectl get pods -n "$NAMESPACE" -l app=demo-api,color="$NEW_COLOR" -o jsonpath='{.items[*].status.podIP}')
+          if [ -z "$PODS" ]; then
+            echo "::error::No se encontraron pods para el color $NEW_COLOR"
+            exit 1
+          fi
+          for pod_ip in $PODS; do
+            ok=""
+            for intento in 1 2 3; do
+              if curl -sf --max-time 5 "http://$pod_ip:3000/health" | grep -q "\"color\":\"$NEW_COLOR\""; then
+                ok="1"
+                break
+              fi
+              sleep 2
+            done
+            if [ -z "$ok" ]; then
+              echo "::error::Falló el health check en el pod $pod_ip (color $NEW_COLOR)"
+              exit 1
+            fi
+            echo "OK: $pod_ip responde sano con color=$NEW_COLOR"
+          done
+          EOF
+
+      - name: 8 · Mover el 100% del tráfico (switch del selector)
+        run: |
+          SERVER="ubuntu@${{ inputs.k3s-server-public-ip }}"
+          ssh -o StrictHostKeyChecking=accept-new "$SERVER" \
+            "sudo k3s kubectl patch service demo-api -n ${{ inputs.namespace }} -p '{\"spec\":{\"selector\":{\"color\":\"${{ steps.colors.outputs.new }}\"}}}'"
+
+      - name: 9 · Validación de salud (post-switch, vía NodePort)
+        run: |
+          IP="${{ inputs.k3s-server-public-ip }}"
+          for intento in 1 2 3; do
+            if curl -sf --max-time 5 "http://$IP:30090/health" | grep -q "\"color\":\"${{ steps.colors.outputs.new }}\""; then
+              echo "OK: NodePort responde con color=${{ steps.colors.outputs.new }}"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::La validación post-switch por NodePort falló"
+          exit 1
+
+      - name: 10 · Rollback automático (si algo falló)
         if: failure()
         run: |
-          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" \
-            'sudo k3s kubectl rollout undo deployment/demo-api'
-          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" \
-            'sudo k3s kubectl rollout status deployment/demo-api --timeout=60s'
+          SERVER="ubuntu@${{ inputs.k3s-server-public-ip }}"
+          ACTIVE="${{ steps.colors.outputs.active }}"
+          NEW="${{ steps.colors.outputs.new }}"
+          if [ "$ACTIVE" != "none" ] && [ "$ACTIVE" != "$NEW" ]; then
+            echo "Revirtiendo selector al color estable: $ACTIVE"
+            ssh -o StrictHostKeyChecking=accept-new "$SERVER" \
+              "sudo k3s kubectl patch service demo-api -n ${{ inputs.namespace }} -p '{\"spec\":{\"selector\":{\"color\":\"$ACTIVE\"}}}'"
+          else
+            echo "No había color estable previo (primer despliegue); no se revierte el selector."
+          fi
+          echo "Escalando a 0 el color fallido: $NEW"
+          ssh -o StrictHostKeyChecking=accept-new "$SERVER" \
+            "sudo k3s kubectl scale deployment/demo-api-$NEW -n ${{ inputs.namespace }} --replicas=0" || true
 
-      - name: Verificar pods
+      - name: 11 · Estado final del clúster
         if: always()
-        run: ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" 'sudo k3s kubectl get pods -o wide'
+        run: |
+          SERVER="ubuntu@${{ inputs.k3s-server-public-ip }}"
+          ssh -o StrictHostKeyChecking=accept-new "$SERVER" \
+            'sudo k3s kubectl get pods,svc -n ${{ inputs.namespace }} -o wide'
