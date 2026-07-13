@@ -1,0 +1,31 @@
+# ─────────────────────────────────────────────────────────────
+# Utilidad: agrega una clave publica SSH al servidor K3S,
+# usando la llave EA2_SSH_PRIVATE_KEY que ya funciona.
+# No es parte del pipeline de deploy, solo una herramienta de acceso.
+# ─────────────────────────────────────────────────────────────
+name: Autorizar llave SSH personal
+
+on:
+  workflow_dispatch:
+    inputs:
+      public_key:
+        description: Clave publica SSH (contenido de tu archivo .pub)
+        required: true
+        type: string
+      k3s-server-public-ip:
+        description: IP publica del servidor K3S
+        required: true
+        type: string
+
+jobs:
+  autorizar:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.EA2_SSH_PRIVATE_KEY }}
+
+      - name: Agregar clave publica a authorized_keys
+        run: |
+          ssh -o StrictHostKeyChecking=accept-new "ubuntu@${{ inputs.k3s-server-public-ip }}" \
+            "echo '${{ inputs.public_key }}' >> ~/.ssh/authorized_keys && sort -u ~/.ssh/authorized_keys -o ~/.ssh/authorized_keys && echo listo"
